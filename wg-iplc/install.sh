@@ -1,18 +1,5 @@
-bash <<'EOF'
+#!/usr/bin/env bash
 set -euo pipefail
-
-# =========================================================
-# 沪日 IPLC WireGuard 游戏专线一键部署
-#
-# 日本公网 IP:       87.86.22.157
-# 日本公网网关:      87.86.22.1
-#
-# 专线内网 IP:       172.16.4.48
-# 移动专线入口:      211.136.162.188
-#
-# 专线端口范围:      4800-4899
-# SSH:               4800
-# =========================================================
 
 JP_IP="87.86.22.157"
 JP_GW="87.86.22.1"
@@ -23,14 +10,11 @@ IPLC_EXTERNAL_IP="114.111.176.56"
 
 WG_IF="wg-iplc"
 WG_PORT="4888"
-
 WG_NET="10.66.66"
 WG_SERVER_IP="${WG_NET}.1"
 WG_CLIENT_IP="${WG_NET}.2"
 WG_CIDR="${WG_NET}.0/24"
-
 WG_MTU="1380"
-
 ROUTE_TABLE="51888"
 ROUTE_PRIORITY="11088"
 
@@ -40,240 +24,139 @@ SERVER_PUB_FILE="${WG_DIR}/iplc-server.pub"
 CLIENT_PRIV_FILE="${WG_DIR}/iplc-client.key"
 CLIENT_PUB_FILE="${WG_DIR}/iplc-client.pub"
 
-# =========================================================
-# 基础检查
-# =========================================================
+SS_PORT="4887"
+SS_METHOD="2022-blake3-aes-128-gcm"
+SS_DIR="/etc/shadowsocks-rust"
+SS_CONFIG="${SS_DIR}/iplc-ss.json"
+SS_PASS_FILE="${SS_DIR}/iplc-ss.key"
+SS_BIN="/usr/local/bin/ssserver-iplc"
+SS_SERVICE="ss-iplc"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "错误：请使用 root 用户运行"
     exit 1
 fi
 
-echo
-echo "=============================================="
-echo " 沪日 IPLC WireGuard 游戏专线"
-echo "=============================================="
-echo
-
 if ! command -v apt >/dev/null 2>&1; then
     echo "错误：该脚本用于 Debian / Ubuntu"
     exit 1
 fi
 
-echo "[1/9] 安装 WireGuard..."
+echo "=============================================="
+echo " 沪日 IPLC WireGuard + Shadowsocks 游戏专线"
+echo "=============================================="
 
+echo "[1/10] 安装依赖..."
 apt update
 DEBIAN_FRONTEND=noninteractive apt install -y \
-    wireguard \
-    wireguard-tools \
-    iptables \
-    iproute2 \
-    curl
+    wireguard wireguard-tools iptables iproute2 curl ca-certificates xz-utils
 
-# =========================================================
-# 自动识别双网卡
-# =========================================================
-
-echo
-echo "[2/9] 自动识别网卡..."
-
-JP_IF=$(
-    ip -o -4 addr show |
-    awk -v ip="${JP_IP}" '
-    {
-        split($4,a,"/")
-        if (a[1] == ip) {
-            print $2
-            exit
-        }
-    }'
-)
-
-IPLC_IF=$(
-    ip -o -4 addr show |
-    awk -v ip="${IPLC_IP}" '
-    {
-        split($4,a,"/")
-        if (a[1] == ip) {
-            print $2
-            exit
-        }
-    }'
-)
+echo "[2/10] 自动识别双网卡..."
+JP_IF=$(ip -o -4 addr show | awk -v ip="${JP_IP}" '{split($4,a,"/"); if (a[1] == ip) {print $2; exit}}')
+IPLC_IF=$(ip -o -4 addr show | awk -v ip="${IPLC_IP}" '{split($4,a,"/"); if (a[1] == ip) {print $2; exit}}')
 
 if [ -z "${JP_IF}" ]; then
     echo "错误：没有找到日本公网 IP ${JP_IP} 所在网卡"
-    echo
     ip -br -4 addr
     exit 1
 fi
 
 if [ -z "${IPLC_IF}" ]; then
     echo "错误：没有找到专线 IP ${IPLC_IP} 所在网卡"
-    echo
     ip -br -4 addr
     exit 1
 fi
 
-echo "日本公网网卡： ${JP_IF}"
-echo "  IP：          ${JP_IP}"
-echo "  网关：        ${JP_GW}"
-echo
-echo "IPLC 专线网卡：${IPLC_IF}"
-echo "  IP：          ${IPLC_IP}"
-
 if [ "${JP_IF}" = "${IPLC_IF}" ]; then
-    echo "错误：检测到两个 IP 位于同一个网卡，和预期双网卡结构不符"
+    echo "错误：两个 IP 位于同一网卡，和预期双网卡结构不符"
     exit 1
 fi
 
-# =========================================================
-# 检查 WireGuard UDP 端口
-# =========================================================
+echo "日本公网网卡：${JP_IF} (${JP_IP})"
+echo "IPLC 专线网卡：${IPLC_IF} (${IPLC_IP})"
 
-echo
-echo "[3/9] 检查 UDP 端口..."
-
-if ss -H -lun 2>/dev/null | awk '{print $5}' | grep -Eq ":${WG_PORT}$"; then
-    echo "UDP ${WG_PORT} 已占用，自动寻找 4801-4899 空闲端口..."
-
-    FOUND_PORT=""
-
-    for P in $(seq 4801 4899); do
-        if ! ss -H -lun 2>/dev/null | awk '{print $5}' | grep -Eq ":${P}$"; then
-            FOUND_PORT="$P"
-            break
-        fi
-    done
-
-    if [ -z "${FOUND_PORT}" ]; then
-        echo "错误：4801-4899 没有可用 UDP 端口"
-        exit 1
-    fi
-
-    WG_PORT="${FOUND_PORT}"
+if ss -H -lunp 2>/dev/null | grep -Eq ":${WG_PORT}\b" && ! systemctl is-active --quiet "wg-quick@${WG_IF}" 2>/dev/null; then
+    echo "错误：UDP ${WG_PORT} 已被其他程序占用"
+    exit 1
 fi
 
-echo "WireGuard UDP 端口：${WG_PORT}"
+if { ss -H -ltnp 2>/dev/null; ss -H -lunp 2>/dev/null; } | grep -Eq ":${SS_PORT}\b" && ! systemctl is-active --quiet "${SS_SERVICE}" 2>/dev/null; then
+    echo "错误：TCP/UDP ${SS_PORT} 已被其他程序占用"
+    exit 1
+fi
 
-# =========================================================
-# 清理/备份旧配置
-# =========================================================
-
-echo
-echo "[4/9] 创建 WireGuard 密钥..."
-
+echo "[3/10] 准备 WireGuard 密钥..."
 mkdir -p "${WG_DIR}"
 chmod 700 "${WG_DIR}"
-
-if systemctl is-active --quiet "wg-quick@${WG_IF}" 2>/dev/null; then
-    systemctl stop "wg-quick@${WG_IF}" || true
-fi
-
-if [ -f "${WG_DIR}/${WG_IF}.conf" ]; then
-    BACKUP="${WG_DIR}/${WG_IF}.conf.bak.$(date +%Y%m%d-%H%M%S)"
-    cp "${WG_DIR}/${WG_IF}.conf" "${BACKUP}"
-    echo "旧配置已备份：${BACKUP}"
-fi
-
 umask 077
 
-wg genkey > "${SERVER_PRIV_FILE}"
-wg pubkey < "${SERVER_PRIV_FILE}" > "${SERVER_PUB_FILE}"
-
-wg genkey > "${CLIENT_PRIV_FILE}"
-wg pubkey < "${CLIENT_PRIV_FILE}" > "${CLIENT_PUB_FILE}"
+if [ ! -s "${SERVER_PRIV_FILE}" ]; then
+    wg genkey > "${SERVER_PRIV_FILE}"
+fi
+if [ ! -s "${SERVER_PUB_FILE}" ]; then
+    wg pubkey < "${SERVER_PRIV_FILE}" > "${SERVER_PUB_FILE}"
+fi
+if [ ! -s "${CLIENT_PRIV_FILE}" ]; then
+    wg genkey > "${CLIENT_PRIV_FILE}"
+fi
+if [ ! -s "${CLIENT_PUB_FILE}" ]; then
+    wg pubkey < "${CLIENT_PRIV_FILE}" > "${CLIENT_PUB_FILE}"
+fi
 
 SERVER_PRIV=$(cat "${SERVER_PRIV_FILE}")
 SERVER_PUB=$(cat "${SERVER_PUB_FILE}")
-
 CLIENT_PRIV=$(cat "${CLIENT_PRIV_FILE}")
 CLIENT_PUB=$(cat "${CLIENT_PUB_FILE}")
 
-# =========================================================
-# 系统网络参数
-# =========================================================
+chmod 600 "${SERVER_PRIV_FILE}" "${SERVER_PUB_FILE}" "${CLIENT_PRIV_FILE}" "${CLIENT_PUB_FILE}"
 
-echo
-echo "[5/9] 配置转发和双网卡参数..."
-
-cat > /etc/sysctl.d/99-wg-iplc-game.conf <<EOF2
-# WireGuard 转发
+echo "[4/10] 配置系统网络参数..."
+cat > /etc/sysctl.d/99-wg-iplc-game.conf <<EOF
 net.ipv4.ip_forward=1
-
-# 双 WAN / IPLC 环境避免严格反向路径检查误杀
 net.ipv4.conf.all.rp_filter=2
 net.ipv4.conf.default.rp_filter=2
 net.ipv4.conf.${JP_IF}.rp_filter=2
 net.ipv4.conf.${IPLC_IF}.rp_filter=2
-
-# 有利于带 mark 的多路由环境
 net.ipv4.conf.all.src_valid_mark=1
-EOF2
-
+EOF
 sysctl --system >/dev/null
 
-# =========================================================
-# WireGuard 服务端配置
-# =========================================================
+echo "[5/10] 创建 WireGuard 服务端和客户端配置..."
+if [ -f "${WG_DIR}/${WG_IF}.conf" ]; then
+    cp "${WG_DIR}/${WG_IF}.conf" "${WG_DIR}/${WG_IF}.conf.bak.$(date +%Y%m%d-%H%M%S)"
+fi
 
-echo
-echo "[6/9] 创建 WireGuard 服务端配置..."
-
-cat > "${WG_DIR}/${WG_IF}.conf" <<EOF2
+cat > "${WG_DIR}/${WG_IF}.conf" <<EOF
 [Interface]
 Address = ${WG_SERVER_IP}/24
 ListenPort = ${WG_PORT}
 PrivateKey = ${SERVER_PRIV}
 MTU = ${WG_MTU}
 
-# ---------------------------------------------------------
-# 只允许专线网卡进入 WireGuard
-# ---------------------------------------------------------
-PostUp = iptables -I INPUT 1 -i ${IPLC_IF} -p udp --dport ${WG_PORT} -j ACCEPT
-PostDown = iptables -D INPUT -i ${IPLC_IF} -p udp --dport ${WG_PORT} -j ACCEPT || true
+PostUp = iptables -C INPUT -i ${IPLC_IF} -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i ${IPLC_IF} -p udp --dport ${WG_PORT} -j ACCEPT
+PostDown = iptables -D INPUT -i ${IPLC_IF} -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || true
 
-# ---------------------------------------------------------
-# WG -> 日本公网
-# ---------------------------------------------------------
-PostUp = iptables -I FORWARD 1 -i ${WG_IF} -o ${JP_IF} -j ACCEPT
-PostUp = iptables -I FORWARD 1 -i ${JP_IF} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = iptables -C FORWARD -i ${WG_IF} -o ${JP_IF} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i ${WG_IF} -o ${JP_IF} -j ACCEPT
+PostUp = iptables -C FORWARD -i ${JP_IF} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i ${JP_IF} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = iptables -D FORWARD -i ${WG_IF} -o ${JP_IF} -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -i ${JP_IF} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 
-PostDown = iptables -D FORWARD -i ${WG_IF} -o ${JP_IF} -j ACCEPT || true
-PostDown = iptables -D FORWARD -i ${JP_IF} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || true
+PostUp = iptables -t nat -C POSTROUTING -s ${WG_CIDR} -o ${JP_IF} -j SNAT --to-source ${JP_IP} 2>/dev/null || iptables -t nat -A POSTROUTING -s ${WG_CIDR} -o ${JP_IF} -j SNAT --to-source ${JP_IP}
+PostDown = iptables -t nat -D POSTROUTING -s ${WG_CIDR} -o ${JP_IF} -j SNAT --to-source ${JP_IP} 2>/dev/null || true
 
-# ---------------------------------------------------------
-# 强制游戏流量使用日本公网 IP 出口
-# ---------------------------------------------------------
-PostUp = iptables -t nat -A POSTROUTING -s ${WG_CIDR} -o ${JP_IF} -j SNAT --to-source ${JP_IP}
-PostDown = iptables -t nat -D POSTROUTING -s ${WG_CIDR} -o ${JP_IF} -j SNAT --to-source ${JP_IP} || true
-
-# ---------------------------------------------------------
-# 独立路由表：
-# 10.66.66.0/24 解密后的流量强制从日本公网网卡出去
-# 不依赖系统默认路由
-# ---------------------------------------------------------
 PostUp = ip route replace table ${ROUTE_TABLE} default via ${JP_GW} dev ${JP_IF} onlink
 PostUp = ip rule del priority ${ROUTE_PRIORITY} 2>/dev/null || true; ip rule add priority ${ROUTE_PRIORITY} from ${WG_CIDR} table ${ROUTE_TABLE}
-
 PostDown = ip rule del priority ${ROUTE_PRIORITY} 2>/dev/null || true
 PostDown = ip route flush table ${ROUTE_TABLE} 2>/dev/null || true
 
 [Peer]
 PublicKey = ${CLIENT_PUB}
 AllowedIPs = ${WG_CLIENT_IP}/32
-EOF2
+EOF
 
 chmod 600 "${WG_DIR}/${WG_IF}.conf"
 
-# =========================================================
-# 创建原生 WireGuard 客户端配置
-# =========================================================
-
-echo
-echo "[7/9] 创建客户端配置..."
-
-cat > "${WG_DIR}/iplc-client.conf" <<EOF2
+cat > "${WG_DIR}/iplc-client.conf" <<EOF
 [Interface]
 PrivateKey = ${CLIENT_PRIV}
 Address = ${WG_CLIENT_IP}/24
@@ -284,15 +167,86 @@ PublicKey = ${SERVER_PUB}
 Endpoint = ${IPLC_MOBILE_ENTRY}:${WG_PORT}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 15
-EOF2
+EOF
 
 chmod 600 "${WG_DIR}/iplc-client.conf"
 
-# =========================================================
-# OpenClash / Mihomo 配置
-# =========================================================
+echo "[6/10] 安装 Shadowsocks-Rust..."
+mkdir -p "${SS_DIR}"
+chmod 700 "${SS_DIR}"
 
-cat > "${WG_DIR}/openclash-iplc.yaml" <<EOF2
+case "$(uname -m)" in
+    x86_64|amd64) SS_ARCH="x86_64" ;;
+    aarch64|arm64) SS_ARCH="aarch64" ;;
+    *)
+        echo "错误：暂不支持该架构：$(uname -m)"
+        exit 1
+        ;;
+esac
+
+SS_VERSION=$(curl -fsSL https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest \
+    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -n1)
+
+if [ -z "${SS_VERSION}" ]; then
+    echo "错误：无法获取 Shadowsocks-Rust 最新版本"
+    exit 1
+fi
+
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "${TMP_DIR}"' EXIT
+SS_ARCHIVE="shadowsocks-${SS_VERSION}.${SS_ARCH}-unknown-linux-musl.tar.xz"
+SS_URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${SS_VERSION}/${SS_ARCHIVE}"
+
+curl -fL "${SS_URL}" -o "${TMP_DIR}/${SS_ARCHIVE}"
+tar -xJf "${TMP_DIR}/${SS_ARCHIVE}" -C "${TMP_DIR}"
+install -m 755 "${TMP_DIR}/ssserver" "${SS_BIN}"
+rm -rf "${TMP_DIR}"
+trap - EXIT
+
+if [ ! -s "${SS_PASS_FILE}" ]; then
+    head -c 16 /dev/urandom | base64 | tr -d '\n' > "${SS_PASS_FILE}"
+fi
+SS_PASSWORD=$(cat "${SS_PASS_FILE}")
+chmod 600 "${SS_PASS_FILE}"
+
+cat > "${SS_CONFIG}" <<EOF
+{
+  "server": "${IPLC_IP}",
+  "server_port": ${SS_PORT},
+  "password": "${SS_PASSWORD}",
+  "method": "${SS_METHOD}",
+  "mode": "tcp_and_udp",
+  "outbound_bind_interface": "${JP_IF}",
+  "outbound_bind_addr": "${JP_IP}",
+  "outbound_udp_allow_fragmentation": true
+}
+EOF
+chmod 600 "${SS_CONFIG}"
+
+cat > /etc/systemd/system/${SS_SERVICE}.service <<EOF
+[Unit]
+Description=IPLC Shadowsocks-Rust Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -c '/usr/sbin/iptables -C INPUT -i ${IPLC_IF} -p tcp --dport ${SS_PORT} -j ACCEPT 2>/dev/null || /usr/sbin/iptables -I INPUT 1 -i ${IPLC_IF} -p tcp --dport ${SS_PORT} -j ACCEPT'
+ExecStartPre=/bin/sh -c '/usr/sbin/iptables -C INPUT -i ${IPLC_IF} -p udp --dport ${SS_PORT} -j ACCEPT 2>/dev/null || /usr/sbin/iptables -I INPUT 1 -i ${IPLC_IF} -p udp --dport ${SS_PORT} -j ACCEPT'
+ExecStart=${SS_BIN} -c ${SS_CONFIG}
+ExecStopPost=/bin/sh -c '/usr/sbin/iptables -D INPUT -i ${IPLC_IF} -p tcp --dport ${SS_PORT} -j ACCEPT 2>/dev/null || true'
+ExecStopPost=/bin/sh -c '/usr/sbin/iptables -D INPUT -i ${IPLC_IF} -p udp --dport ${SS_PORT} -j ACCEPT 2>/dev/null || true'
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "[7/10] 创建 OpenClash / Mihomo 节点配置..."
+cat > "${WG_DIR}/openclash-iplc.yaml" <<EOF
 proxies:
   - name: "沪日-IPLC-WG"
     type: wireguard
@@ -306,51 +260,65 @@ proxies:
     persistent-keepalive: 15
     udp: true
     mtu: ${WG_MTU}
-EOF2
 
+  - name: "沪日-IPLC-SS"
+    type: ss
+    server: ${IPLC_MOBILE_ENTRY}
+    port: ${SS_PORT}
+    cipher: ${SS_METHOD}
+    password: "${SS_PASSWORD}"
+    udp: true
+EOF
 chmod 600 "${WG_DIR}/openclash-iplc.yaml"
 
-# =========================================================
-# 启动
-# =========================================================
+cat > "${SS_DIR}/openclash-ss.yaml" <<EOF
+proxies:
+  - name: "沪日-IPLC-SS"
+    type: ss
+    server: ${IPLC_MOBILE_ENTRY}
+    port: ${SS_PORT}
+    cipher: ${SS_METHOD}
+    password: "${SS_PASSWORD}"
+    udp: true
+EOF
+chmod 600 "${SS_DIR}/openclash-ss.yaml"
 
-echo
-echo "[8/9] 启动 WireGuard..."
-
+echo "[8/10] 启动 WireGuard 和 Shadowsocks..."
 systemctl daemon-reload
-systemctl enable "wg-quick@${WG_IF}" >/dev/null
+systemctl enable "wg-quick@${WG_IF}" "${SS_SERVICE}" >/dev/null
 systemctl restart "wg-quick@${WG_IF}"
+systemctl restart "${SS_SERVICE}"
 
 sleep 1
 
 if ! systemctl is-active --quiet "wg-quick@${WG_IF}"; then
-    echo
     echo "WireGuard 启动失败："
     journalctl -u "wg-quick@${WG_IF}" --no-pager -n 50
     exit 1
 fi
 
-# =========================================================
-# 创建快捷管理命令 wgggg
-# =========================================================
+if ! systemctl is-active --quiet "${SS_SERVICE}"; then
+    echo "Shadowsocks 启动失败："
+    journalctl -u "${SS_SERVICE}" --no-pager -n 50
+    exit 1
+fi
 
-echo
 echo "[9/10] 创建快捷管理命令 wgggg..."
-
 cat > /usr/local/bin/wgggg <<'WGGMENU'
 #!/usr/bin/env bash
 
 WG_IF="wg-iplc"
+WG_SERVICE="wg-quick@wg-iplc"
 WG_DIR="/etc/wireguard"
-SERVICE="wg-quick@${WG_IF}"
+SS_SERVICE="ss-iplc"
+SS_DIR="/etc/shadowsocks-rust"
 
 if [ "$(id -u)" -ne 0 ]; then
     if command -v sudo >/dev/null 2>&1; then
         exec sudo "$0" "$@"
-    else
-        echo "请使用 root 用户运行 wgggg"
-        exit 1
     fi
+    echo "请使用 root 用户运行 wgggg"
+    exit 1
 fi
 
 pause() {
@@ -358,157 +326,193 @@ pause() {
     read -rp "按回车返回菜单..." _
 }
 
-do_start() {
-    echo
-    echo "正在启动 ${WG_IF} ..."
-    systemctl start "${SERVICE}"
-    echo "启动完成。"
-    wg show "${WG_IF}" 2>/dev/null || true
+status_word() {
+    if systemctl is-active --quiet "$1"; then
+        echo "运行中"
+    else
+        echo "已停止"
+    fi
 }
 
-do_stop() {
-    echo
-    echo "正在停止 ${WG_IF} ..."
-    systemctl stop "${SERVICE}"
-    echo "已停止。"
+wg_start() { systemctl start "${WG_SERVICE}"; }
+wg_stop() { systemctl stop "${WG_SERVICE}"; }
+wg_restart() { systemctl restart "${WG_SERVICE}"; }
+ss_start() { systemctl start "${SS_SERVICE}"; }
+ss_stop() { systemctl stop "${SS_SERVICE}"; }
+ss_restart() { systemctl restart "${SS_SERVICE}"; }
+
+all_start() {
+    wg_start
+    ss_start
 }
 
-do_restart() {
-    echo
-    echo "正在重启 ${WG_IF} ..."
-    systemctl restart "${SERVICE}"
-    echo "重启完成。"
-    wg show "${WG_IF}" 2>/dev/null || true
+all_stop() {
+    wg_stop
+    ss_stop
 }
 
-do_status() {
-    systemctl --no-pager -l status "${SERVICE}" || true
+all_restart() {
+    wg_restart
+    ss_restart
 }
 
-do_show() {
+show_status() {
+    echo "WG：$(status_word "${WG_SERVICE}")"
+    echo "SS：$(status_word "${SS_SERVICE}")"
     echo
+    systemctl --no-pager -l status "${WG_SERVICE}" "${SS_SERVICE}" || true
+}
+
+show_wg() {
     wg show "${WG_IF}" || true
 }
 
-do_live() {
-    echo "按 Ctrl+C 退出实时监控"
+show_live() {
+    echo "按 Ctrl+C 退出"
     sleep 1
     watch -n1 "wg show ${WG_IF}"
 }
 
-do_server_config() {
-    echo
-    echo "===== 服务端配置 ====="
-    cat "${WG_DIR}/${WG_IF}.conf"
-}
-
-do_openclash_config() {
-    echo
-    echo "===== OpenClash / Mihomo 节点配置 ====="
+show_openclash() {
     cat "${WG_DIR}/openclash-iplc.yaml"
 }
 
-do_client_config() {
-    echo
-    echo "===== WireGuard 客户端配置 ====="
+show_wg_client() {
     cat "${WG_DIR}/iplc-client.conf"
 }
 
-do_logs() {
-    journalctl -u "${SERVICE}" -n 100 --no-pager
+show_ss_config() {
+    echo "===== Shadowsocks 服务端 ====="
+    cat "${SS_DIR}/iplc-ss.json"
+    echo
+    echo "===== OpenClash SS 节点 ====="
+    cat "${SS_DIR}/openclash-ss.yaml"
 }
 
-do_enable() {
-    systemctl enable "${SERVICE}"
-    echo "已开启开机自启。"
+show_wg_logs() {
+    journalctl -u "${WG_SERVICE}" -n 100 --no-pager
 }
 
-do_disable() {
-    systemctl disable "${SERVICE}"
-    echo "已关闭开机自启。"
+show_ss_logs() {
+    journalctl -u "${SS_SERVICE}" -n 100 --no-pager
 }
 
-run_arg() {
-    case "${1:-}" in
-        start) do_start ;;
-        stop) do_stop ;;
-        restart) do_restart ;;
-        status) do_status ;;
-        show) do_show ;;
-        live) do_live ;;
-        server) do_server_config ;;
-        openclash) do_openclash_config ;;
-        client) do_client_config ;;
-        logs) do_logs ;;
-        enable) do_enable ;;
-        disable) do_disable ;;
-        *)
-            echo "用法："
-            echo "  wgggg"
-            echo "  wgggg start"
-            echo "  wgggg stop"
-            echo "  wgggg restart"
-            echo "  wgggg status"
-            echo "  wgggg show"
-            echo "  wgggg live"
-            echo "  wgggg server"
-            echo "  wgggg openclash"
-            echo "  wgggg client"
-            echo "  wgggg logs"
-            echo "  wgggg enable"
-            echo "  wgggg disable"
-            exit 1
-            ;;
-    esac
+enable_all() {
+    systemctl enable "${WG_SERVICE}" "${SS_SERVICE}"
+}
+
+disable_all() {
+    systemctl disable "${WG_SERVICE}" "${SS_SERVICE}"
+}
+
+usage() {
+    echo "wgggg"
+    echo "wgggg wg start|stop|restart|status|show|live|logs|client"
+    echo "wgggg ss start|stop|restart|status|show|logs"
+    echo "wgggg all start|stop|restart|status"
+    echo "wgggg openclash"
 }
 
 if [ $# -gt 0 ]; then
-    run_arg "$1"
+    case "${1:-}" in
+        wg)
+            case "${2:-}" in
+                start) wg_start ;;
+                stop) wg_stop ;;
+                restart) wg_restart ;;
+                status) systemctl --no-pager -l status "${WG_SERVICE}" || true ;;
+                show) show_wg ;;
+                live) show_live ;;
+                logs) show_wg_logs ;;
+                client) show_wg_client ;;
+                *) usage; exit 1 ;;
+            esac
+            ;;
+        ss)
+            case "${2:-}" in
+                start) ss_start ;;
+                stop) ss_stop ;;
+                restart) ss_restart ;;
+                status) systemctl --no-pager -l status "${SS_SERVICE}" || true ;;
+                show) show_ss_config ;;
+                logs) show_ss_logs ;;
+                *) usage; exit 1 ;;
+            esac
+            ;;
+        all)
+            case "${2:-}" in
+                start) all_start ;;
+                stop) all_stop ;;
+                restart) all_restart ;;
+                status) show_status ;;
+                *) usage; exit 1 ;;
+            esac
+            ;;
+        openclash) show_openclash ;;
+        start) wg_start ;;
+        stop) wg_stop ;;
+        restart) wg_restart ;;
+        status) systemctl --no-pager -l status "${WG_SERVICE}" || true ;;
+        show) show_wg ;;
+        live) show_live ;;
+        logs) show_wg_logs ;;
+        client) show_wg_client ;;
+        *) usage; exit 1 ;;
+    esac
     exit $?
 fi
 
 while true; do
     clear
     echo "======================================================"
-    echo "       沪日 IPLC WireGuard 管理菜单"
+    echo "       沪日 IPLC WG + SS2022 管理菜单"
     echo "======================================================"
-
-    if systemctl is-active --quiet "${SERVICE}"; then
-        echo "当前状态：运行中"
-    else
-        echo "当前状态：已停止"
-    fi
-
+    echo "WG：$(status_word "${WG_SERVICE}")"
+    echo "SS：$(status_word "${SS_SERVICE}")"
     echo
     echo "  1. 启动 WireGuard"
     echo "  2. 停止 WireGuard"
     echo "  3. 重启 WireGuard"
-    echo "  4. 查看服务状态"
-    echo "  5. 查看 WireGuard 握手/流量"
-    echo "  6. 实时查看 WireGuard 流量"
-    echo "  7. 查看服务端配置"
-    echo "  8. 查看 OpenClash 节点配置"
-    echo "  9. 查看原生客户端配置"
-    echo " 10. 查看最近 100 行日志"
-    echo " 11. 开启开机自启"
-    echo " 12. 关闭开机自启"
+    echo "  4. 启动 Shadowsocks"
+    echo "  5. 停止 Shadowsocks"
+    echo "  6. 重启 Shadowsocks"
+    echo "  7. 启动 WG + SS"
+    echo "  8. 停止 WG + SS"
+    echo "  9. 重启 WG + SS"
+    echo " 10. 查看服务状态"
+    echo " 11. 查看 WG 握手/流量"
+    echo " 12. 实时查看 WG 流量"
+    echo " 13. 查看 OpenClash 两个节点"
+    echo " 14. 查看 WG 客户端配置"
+    echo " 15. 查看 SS 配置"
+    echo " 16. 查看 WG 日志"
+    echo " 17. 查看 SS 日志"
+    echo " 18. 开启 WG + SS 开机自启"
+    echo " 19. 关闭 WG + SS 开机自启"
     echo "  0. 退出"
     echo
-    read -rp "请选择 [0-12]: " choice
+    read -rp "请选择 [0-19]: " choice
 
-    case "$choice" in
-        1) do_start; pause ;;
-        2) do_stop; pause ;;
-        3) do_restart; pause ;;
-        4) do_status; pause ;;
-        5) do_show; pause ;;
-        6) do_live ;;
-        7) do_server_config; pause ;;
-        8) do_openclash_config; pause ;;
-        9) do_client_config; pause ;;
-        10) do_logs; pause ;;
-        11) do_enable; pause ;;
-        12) do_disable; pause ;;
+    case "${choice}" in
+        1) wg_start; pause ;;
+        2) wg_stop; pause ;;
+        3) wg_restart; pause ;;
+        4) ss_start; pause ;;
+        5) ss_stop; pause ;;
+        6) ss_restart; pause ;;
+        7) all_start; pause ;;
+        8) all_stop; pause ;;
+        9) all_restart; pause ;;
+        10) show_status; pause ;;
+        11) show_wg; pause ;;
+        12) show_live ;;
+        13) show_openclash; pause ;;
+        14) show_wg_client; pause ;;
+        15) show_ss_config; pause ;;
+        16) show_wg_logs; pause ;;
+        17) show_ss_logs; pause ;;
+        18) enable_all; pause ;;
+        19) disable_all; pause ;;
         0) exit 0 ;;
         *) echo "输入无效"; sleep 1 ;;
     esac
@@ -517,85 +521,20 @@ WGGMENU
 
 chmod +x /usr/local/bin/wgggg
 
-# =========================================================
-# 输出结果
-# =========================================================
-
-echo
 echo "[10/10] 部署完成"
 echo
 echo "======================================================"
-echo "        沪日 IPLC WireGuard 部署成功"
+echo "        沪日 IPLC 双协议部署成功"
 echo "======================================================"
+echo "WireGuard：${IPLC_MOBILE_ENTRY}:${WG_PORT}/UDP"
+echo "Shadowsocks：${IPLC_MOBILE_ENTRY}:${SS_PORT}/TCP+UDP"
+echo "SS 加密：${SS_METHOD}"
 echo
-echo "日本公网："
-echo "  网卡：              ${JP_IF}"
-echo "  IP：                ${JP_IP}"
-echo "  网关：              ${JP_GW}"
-echo
-echo "IPLC："
-echo "  网卡：              ${IPLC_IF}"
-echo "  内网 IP：           ${IPLC_IP}"
-echo "  移动入口：          ${IPLC_MOBILE_ENTRY}"
-echo "  面板外部连接 IP：   ${IPLC_EXTERNAL_IP}"
-echo
-echo "WireGuard："
-echo "  UDP 端口：          ${WG_PORT}"
-echo "  Server：            ${WG_SERVER_IP}"
-echo "  Client：            ${WG_CLIENT_IP}"
-echo "  MTU：               ${WG_MTU}"
-echo
-echo "OpenClash Endpoint："
-echo
-echo "  ${IPLC_MOBILE_ENTRY}:${WG_PORT}"
-echo
-echo "------------------------------------------------------"
-echo "服务端公钥："
-echo "${SERVER_PUB}"
-echo
-echo "客户端私钥："
-echo "${CLIENT_PRIV}"
-echo
-echo "------------------------------------------------------"
-echo "OpenClash / Mihomo 节点："
-echo "------------------------------------------------------"
+echo "OpenClash / Mihomo："
 cat "${WG_DIR}/openclash-iplc.yaml"
 echo
-echo "------------------------------------------------------"
-echo "WireGuard 原生客户端："
-echo "------------------------------------------------------"
-cat "${WG_DIR}/iplc-client.conf"
-echo
-echo "------------------------------------------------------"
-echo "当前状态："
-echo "------------------------------------------------------"
-
-wg show "${WG_IF}"
-
-echo
+echo "管理菜单：wgggg"
+echo "WG：wgggg wg restart"
+echo "SS：wgggg ss restart"
+echo "全部：wgggg all restart"
 echo "======================================================"
-echo "配置文件："
-echo
-echo "服务端："
-echo "  ${WG_DIR}/${WG_IF}.conf"
-echo
-echo "OpenClash："
-echo "  ${WG_DIR}/openclash-iplc.yaml"
-echo
-echo "原生 WG 客户端："
-echo "  ${WG_DIR}/iplc-client.conf"
-echo
-echo "查看连接："
-echo "  wg show ${WG_IF}"
-echo
-echo "看实时流量："
-echo "  watch -n1 'wg show ${WG_IF}'"
-echo
-echo "快捷管理菜单："
-echo "  wgggg"
-echo
-echo "也可以直接执行："
-echo "  wgggg start | stop | restart | status | show | live | logs"
-echo
-echo "======================================================"
-EOF
