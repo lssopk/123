@@ -24,7 +24,7 @@ CLIENT_PRIV_FILE="${WG_DIR}/iplc-client.key"
 CLIENT_PUB_FILE="${WG_DIR}/iplc-client.pub"
 
 SS_PORT="4887"
-SS_METHOD="2022-blake3-aes-128-gcm"
+SS_METHOD="aes-256-gcm"
 SS_DIR="/etc/shadowsocks-rust"
 SS_CONFIG="${SS_DIR}/iplc-ss.json"
 SS_PASS_FILE="${SS_DIR}/iplc-ss.key"
@@ -401,7 +401,7 @@ fi
 while true; do
     clear
     echo "======================================================"
-    echo "       沪日 IPLC WG + SS2022 管理菜单"
+    echo "       沪日 IPLC WG + SS AES-256-GCM 管理菜单"
     echo "======================================================"
     echo "WG：$(status_word "${WG_SERVICE}")"
     echo "SS：$(status_word "${SS_SERVICE}")"
