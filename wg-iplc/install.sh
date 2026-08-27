@@ -28,6 +28,7 @@ SS_METHOD="aes-256-gcm"
 SS_DIR="/etc/shadowsocks-rust"
 SS_CONFIG="${SS_DIR}/iplc-ss.json"
 SS_PASS_FILE="${SS_DIR}/iplc-ss.key"
+SS_METHOD_FILE="${SS_DIR}/iplc-ss.method"
 SS_BIN="/usr/local/bin/ssserver-iplc"
 SS_SERVICE="ss-iplc"
 SS_ROUTE_TABLE="51887"
@@ -76,12 +77,12 @@ fi
 echo "日本公网网卡：${JP_IF} (${JP_IP})"
 echo "IPLC 专线网卡：${IPLC_IF} (${IPLC_IP})"
 
-if ss -H -lunp 2>/dev/null | grep -Eq ":${WG_PORT}\b" && ! systemctl is-active --quiet "wg-quick@${WG_IF}" 2>/dev/null; then
+if ss -H -lunp 2>/dev/null | grep -Eq ":${WG_PORT}\\b" && ! systemctl is-active --quiet "wg-quick@${WG_IF}" 2>/dev/null; then
     echo "错误：UDP ${WG_PORT} 已被其他程序占用"
     exit 1
 fi
 
-if { ss -H -ltnp 2>/dev/null; ss -H -lunp 2>/dev/null; } | grep -Eq ":${SS_PORT}\b" && ! systemctl is-active --quiet "${SS_SERVICE}" 2>/dev/null; then
+if { ss -H -ltnp 2>/dev/null; ss -H -lunp 2>/dev/null; } | grep -Eq ":${SS_PORT}\\b" && ! systemctl is-active --quiet "${SS_SERVICE}" 2>/dev/null; then
     echo "错误：TCP/UDP ${SS_PORT} 已被其他程序占用"
     exit 1
 fi
@@ -170,7 +171,7 @@ esac
 
 if [ ! -x "${SS_BIN}" ]; then
     SS_VERSION=$(curl -fsSL https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest \
-        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' \
         | head -n1)
     if [ -z "${SS_VERSION}" ]; then
         echo "错误：无法获取 Shadowsocks-Rust 最新版本"
@@ -187,11 +188,25 @@ if [ ! -x "${SS_BIN}" ]; then
     trap - EXIT
 fi
 
+# aes-256-gcm 使用独立 SS 密码，不复用任何 WireGuard 密钥。
+# 生成 32 字节随机数据并写成 64 位十六进制字符串；服务端和客户端使用同一个 SS 密码。
+# 如果加密方式发生变化，则只轮换 SS 密码，不影响 WG 密钥。
+SS_NEED_NEW_PASSWORD=0
 if [ ! -s "${SS_PASS_FILE}" ]; then
-    head -c 16 /dev/urandom | base64 | tr -d '\n' > "${SS_PASS_FILE}"
+    SS_NEED_NEW_PASSWORD=1
+elif [ ! -s "${SS_METHOD_FILE}" ]; then
+    SS_NEED_NEW_PASSWORD=1
+elif [ "$(cat "${SS_METHOD_FILE}")" != "${SS_METHOD}" ]; then
+    SS_NEED_NEW_PASSWORD=1
 fi
+
+if [ "${SS_NEED_NEW_PASSWORD}" -eq 1 ]; then
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "${SS_PASS_FILE}"
+fi
+printf '%s\n' "${SS_METHOD}" > "${SS_METHOD_FILE}"
+
 SS_PASSWORD=$(cat "${SS_PASS_FILE}")
-chmod 600 "${SS_PASS_FILE}"
+chmod 600 "${SS_PASS_FILE}" "${SS_METHOD_FILE}"
 
 cat > "${SS_CONFIG}" <<EOF
 {
@@ -452,6 +467,7 @@ echo "======================================================"
 echo "WireGuard：${IPLC_MOBILE_ENTRY}:${WG_PORT}/UDP"
 echo "Shadowsocks：${IPLC_MOBILE_ENTRY}:${SS_PORT}/TCP+UDP"
 echo "SS 加密：${SS_METHOD}"
+echo "SS 密码：独立随机 32 字节（64 位十六进制），不复用 WG 密钥"
 echo "SS 出站：${JP_IP} -> table ${SS_ROUTE_TABLE} -> ${JP_GW}"
 echo
 echo "OpenClash / Mihomo："
