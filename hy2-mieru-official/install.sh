@@ -14,7 +14,7 @@ TMP_FILE="$(mktemp)"
 trap 'rm -f "$TMP_FILE"' EXIT
 
 wait_for_apt_lock() {
-  # Don't delete lock files. If another apt/dpkg process is active, wait for it.
+  # Never delete lock files. Wait for the process that owns them.
   if ! command -v fuser >/dev/null 2>&1; then
     return 0
   fi
@@ -52,8 +52,8 @@ wait_for_apt_lock() {
   done
 
   echo "错误：等待 apt/dpkg 锁超过 300 秒。"
-  echo "请先检查正在运行的 apt/dpkg 进程："
-  ps -ef | grep -E '[a]pt|[d]pkg' || true
+  echo "请检查正在运行的 apt/dpkg/unattended-upgrades："
+  ps -ef | grep -E '[a]pt|[d]pkg|[u]nattended' || true
   exit 1
 }
 
@@ -70,9 +70,8 @@ sed -i \
   -e 's/${MIERU_PORT}\/UDP/${MIERU_PORT}\/TCP/g' \
   "$TMP_FILE"
 
-# On Debian/Ubuntu, install the local official Mita .deb through apt-get.
-# DPkg::Lock::Timeout makes apt wait for transient unattended-upgrades/apt jobs
-# instead of immediately failing with /var/lib/dpkg/lock-frontend errors.
+# Patch every Debian/Ubuntu package operation, not only the Mita package install.
+# This closes the race where unattended-upgrades starts after the initial lock check.
 python3 - "$TMP_FILE" <<'PY_PATCH'
 from pathlib import Path
 import sys
@@ -80,14 +79,35 @@ import sys
 p = Path(sys.argv[1])
 s = p.read_text(encoding="utf-8")
 
+# Base dependency stage.
+s = s.replace(
+    'apt-get update',
+    'apt-get -o DPkg::Lock::Timeout=300 update'
+)
+s = s.replace(
+    'apt install -y ',
+    'apt-get -o DPkg::Lock::Timeout=300 install -y '
+)
+
+# Official Mita local .deb installation.
 s = s.replace(
     'dpkg -i "$tmp/$pkg" || { apt-get -f install -y; dpkg -i "$tmp/$pkg"; }',
     'apt-get -o DPkg::Lock::Timeout=300 install -y "$tmp/$pkg"'
 )
 
-# Dependency installation/removal should also tolerate a transient dpkg lock.
-s = s.replace('apt-get install -y ', 'apt-get -o DPkg::Lock::Timeout=300 install -y ')
-s = s.replace('apt-get remove -y mita', 'apt-get -o DPkg::Lock::Timeout=300 remove -y mita')
+# Any remaining apt-get install/remove/fix-dependency commands in the generated menu.
+s = s.replace(
+    'apt-get install -y ',
+    'apt-get -o DPkg::Lock::Timeout=300 install -y '
+)
+s = s.replace(
+    'apt-get -f install -y',
+    'apt-get -o DPkg::Lock::Timeout=300 -f install -y'
+)
+s = s.replace(
+    'apt-get remove -y mita',
+    'apt-get -o DPkg::Lock::Timeout=300 remove -y mita'
+)
 
 p.write_text(s, encoding="utf-8")
 PY_PATCH
